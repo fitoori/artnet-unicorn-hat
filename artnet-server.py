@@ -1,136 +1,138 @@
-# Art-Net protocol for Pimoroni Unicorn Hat
-# Open Pixel Control protocol for Pimoroni Unicorn Hat
-# License: MIT
+#!/usr/bin/env python3
+
+"""
+Art-Net protocol for Pimoroni Unicorn Hat
+Open Pixel Control protocol for Pimoroni Unicorn Hat
+License: MIT
+
+2025-06-22  — v2.0  (Python 3, hardened, lint-clean)
+
+* Listens UDP 6454 (Art-Net, OpCode 0x5000) and TCP 7890 (OPC)
+* Only accepts frames sized for exactly 64 RGB LEDs
+* Rejects malformed packets with explicit log messages
+* Designed for systemd / DietPi service: runs unprivileged, exits non-zero on
+  unrecoverable errors so systemd can restart it.
+
+"""
+from __future__ import annotations
+
+import logging
+import os
+import struct
+from typing import Tuple
+
 import unicornhat as unicorn
-from twisted.internet import protocol, endpoints
+from twisted.internet import endpoints, protocol, reactor
 from twisted.internet.protocol import DatagramProtocol
-from twisted.internet import reactor
 
-# Adjust the LED brightness as needed.
-unicorn.brightness(0.5)
+# ─────────────────────────────── Config ──────────────────────────────────────
+LED_WIDTH, LED_HEIGHT = 8, 8
+LED_COUNT = LED_WIDTH * LED_HEIGHT
+ARTNET_PORT = 6454
+OPC_PORT = 7890
+BRIGHTNESS = float(os.getenv("UHC_BRIGHTNESS", "0.5"))
+LOG_LEVEL = os.getenv("UHC_LOGLEVEL", "INFO").upper()
 
+# ─────────────────────────────── Setup ───────────────────────────────────────
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+unicorn.brightness(max(0.0, min(1.0, BRIGHTNESS)))
+unicorn.off()  # clear display at startup
+
+
+# ──────────────────────────── Art-Net handler ────────────────────────────────
 class ArtNet(DatagramProtocol):
+    """Minimal Art-Net 4 ‘ArtDMX’ receiver (OpCode 0x5000)."""
 
-    def datagramReceived(self, data, (host, port)):
-        if ((len(data) > 18) and (data[0:8] == "Art-Net\x00")):
-            rawbytes = map(ord, data)
-            opcode = rawbytes[8] + (rawbytes[9] << 8)
-            protocolVersion = (rawbytes[10] << 8) + rawbytes[11]
-            if ((opcode == 0x5000) and (protocolVersion >= 14)):
-                sequence = rawbytes[12]
-                physical = rawbytes[13]
-                sub_net = (rawbytes[14] & 0xF0) >> 4
-                universe = rawbytes[14] & 0x0F
-                net = rawbytes[15]
-                rgb_length = (rawbytes[16] << 8) + rawbytes[17]
-                #print "seq %d phy %d sub_net %d uni %d net %d len %d" % \
-                #(sequence, physical, sub_net, universe, net, rgb_length)
-                idx = 18
-                x = 0
-                y = 0
-                while ((idx < (rgb_length+18)) and (y < 8)):
-                    r = rawbytes[idx]
-                    idx += 1
-                    g = rawbytes[idx]
-                    idx += 1
-                    b = rawbytes[idx]
-                    idx += 1
-                    unicorn.set_pixel(x, y, r, g, b)
-                    x += 1
-                    if (x > 7):
-                        x = 0
-                        y += 1
-                unicorn.show()
+    def datagramReceived(self, data: bytes, addr: Tuple[str, int]) -> None:  # noqa: N802
+        host, port = addr
+        if len(data) < 18 or not data.startswith(b"Art-Net\x00"):
+            logging.warning("Rejected non-Art-Net packet from %s:%d", host, port)
+            return
 
+        (
+            op_code,
+            proto_ver,
+            _seq,
+            _phy,
+            sub_universe,
+            net,
+            rgb_len,
+        ) = struct.unpack(">HHBBBxBHB", data[8:18])
+
+        if op_code != 0x5000:
+            logging.debug("Ignored non-ArtDMX OpCode 0x%04X from %s", op_code, host)
+            return
+        if proto_ver < 14:
+            logging.warning("Down-rev Art-Net %d from %s – ignored", proto_ver, host)
+            return
+        if rgb_len != LED_COUNT * 3:
+            logging.warning(
+                "Payload length %d != %d – ignored", rgb_len, LED_COUNT * 3
+            )
+            return
+
+        payload = data[18 : 18 + rgb_len]  # exactly 192 bytes expected
+        for i in range(LED_COUNT):
+            r, g, b = payload[i * 3 : i * 3 + 3]
+            unicorn.set_pixel(i % LED_WIDTH, i // LED_WIDTH, r, g, b)
+        unicorn.show()
+
+
+# ───────────────────────────── OPC handler ───────────────────────────────────
 class OPC(protocol.Protocol):
-    # Parse Open Pixel Control protocol. See http://openpixelcontrol.org/.
-    MAX_LEDS = 64
-    parseState = 0
-    pktChannel = 0
-    pktCommand = 0
-    pktLength = 0
-    pixelCount = 0
-    pixelLimit = 0
+    """Streaming Open Pixel Control receiver (channel 0 only)."""
 
-    def dataReceived(self, data):
-        rawbytes = map(ord, data)
-        #print "len(rawbytes) %d" % len(rawbytes)
-        #print rawbytes
-        i = 0
-        while (i < len(rawbytes)):
-            #print "parseState %d i %d" % (OPC.parseState, i)
-            if (OPC.parseState == 0):   # get OPC.pktChannel
-                OPC.pktChannel = rawbytes[i]
-                i += 1
-                OPC.parseState += 1
-            elif (OPC.parseState == 1): # get OPC.pktCommand
-                OPC.pktCommand = rawbytes[i]
-                i += 1
-                OPC.parseState += 1
-            elif (OPC.parseState == 2): # get OPC.pktLength.highbyte
-                OPC.pktLength = rawbytes[i] << 8
-                i += 1
-                OPC.parseState += 1
-            elif (OPC.parseState == 3): # get OPC.pktLength.lowbyte
-                OPC.pktLength |= rawbytes[i]
-                i += 1
-                OPC.parseState += 1
-                OPC.pixelCount = 0
-                OPC.pixelLimit = min(3*OPC.MAX_LEDS, OPC.pktLength)
-                #print "OPC.pktChannel %d OPC.pktCommand %d OPC.pktLength %d OPC.pixelLimit %d" % \
-                #    (OPC.pktChannel, OPC.pktCommand, OPC.pktLength, OPC.pixelLimit)
-                if (OPC.pktLength > 3*OPC.MAX_LEDS):
-                    print "Received pixel packet exeeds size of buffer! Data discarded."
-                if (OPC.pixelLimit == 0):
-                    OPC.parseState = 0
-            elif (OPC.parseState == 4):
-                copyBytes = min(OPC.pixelLimit - OPC.pixelCount, len(rawbytes) - i)
-                if (copyBytes > 0):
-                    OPC.pixelCount += copyBytes
-                    #print "OPC.pixelLimit %d OPC.pixelCount %d copyBytes %d" % \
-                    #        (OPC.pixelLimit, OPC.pixelCount, copyBytes)
-                    if ((OPC.pktCommand == 0) and (OPC.pktChannel <= 1)):
-                        x = 0
-                        y = 0
-                        iLimit = i + copyBytes
-                        while ((i < iLimit) and (y < 8)):
-                            #print "i %d" % (i)
-                            r = rawbytes[i]
-                            i += 1
-                            g = rawbytes[i]
-                            i += 1
-                            b = rawbytes[i]
-                            i += 1
-                            unicorn.set_pixel(x, y, r, g, b)
-                            #print "x %d y %d r %d g %d b %d" % (x,y,r,g,b)
-                            x += 1
-                            if (x > 7):
-                                x = 0
-                                y += 1
+    _buffer: bytearray = bytearray()
 
-                        if (OPC.pixelCount >= OPC.pixelLimit):
-                            unicorn.show()
-                    else:
-                        i += copyBytes
-                    if (OPC.pixelCount == OPC.pktLength):
-                        OPC.parseState = 0
-                    else:
-                        OPC.parseState += 1
-            elif (OPC.parseState == 5):
-                discardBytes = min(OPC.pktLength - OPC.pixelLimit, len(rawbytes) - i)
-                #print "discardBytes %d" % (discardBytes)
-                OPC.pixelCount += discardBytes
-                i += discardBytes
-                if (OPC.pixelCount >= OPC.pktLength):
-                    OPC.parseState = 0
-            else:
-                print "Invalid OPC.parseState %d" % (OPC.parseState)
+    def dataReceived(self, data: bytes) -> None:  # noqa: N802
+        self._buffer.extend(data)
+        while True:
+            if len(self._buffer) < 4:
+                return  # not enough header yet
+            channel, cmd, length = struct.unpack(">BBH", self._buffer[:4])
+
+            if cmd != 0 or channel > 1:
+                logging.warning("Unsupported OPC cmd=%d channel=%d – dropped", cmd, channel)
+                self._buffer.clear()
+                return
+
+            if length != LED_COUNT * 3:
+                logging.warning("OPC length %d != %d – dropped", length, LED_COUNT * 3)
+                self._buffer.clear()
+                return
+
+            if len(self._buffer) < 4 + length:
+                return  # wait for more
+
+            payload = self._buffer[4 : 4 + length]
+            del self._buffer[: 4 + length]  # consume packet
+
+            for i in range(LED_COUNT):
+                r, g, b = payload[i * 3 : i * 3 + 3]
+                unicorn.set_pixel(i % LED_WIDTH, i // LED_WIDTH, r, g, b)
+            unicorn.show()
 
 
 class OPCFactory(protocol.Factory):
-    def buildProtocol(self, addr):
-        return OPC()
+    protocol = OPC
 
-reactor.listenUDP(6454, ArtNet())
-endpoints.serverFromString(reactor, "tcp:7890").listen(OPCFactory())
-reactor.run()
+
+# ────────────────────────────── Main ─────────────────────────────────────────
+def main() -> None:
+    try:
+        reactor.listenUDP(ARTNET_PORT, ArtNet())
+        endpoints.serverFromString(reactor, f"tcp:{OPC_PORT}").listen(OPCFactory())
+        logging.info("Art-Net on UDP %d, OPC on TCP %d – ready", ARTNET_PORT, OPC_PORT)
+        reactor.run()
+    except Exception as exc:
+        logging.exception("Fatal error: %s", exc)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
